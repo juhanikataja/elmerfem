@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include <cudss.h>
+#ifdef HAVE_MPI
+#include <mpi.h>
+#endif
 
 typedef struct {
   cudssHandle_t handle;
@@ -37,6 +40,13 @@ typedef struct {
   void  *d_vals;
   void  *d_b;
   void  *d_x;
+
+#ifdef HAVE_MPI
+  /* MGMN only: kept alive for the whole factorization because the cuDSS
+   * communication layer holds a pointer to this MPI_Comm, not a copy. */
+  int      dist;
+  MPI_Comm comm;
+#endif
 } ElmerCUDSS;
 
 static int cuda_ok(cudaError_t st, const char *what)
@@ -238,6 +248,169 @@ void FC_FUNC_(cudss_ffree,CUDSS_FFREE)(ElmerCUDSS **handle)
 {
   cudss_teardown(*handle);
   *handle = NULL;
+}
+
+/* ------------------------------------------------------------------------- *
+ * MGMN (multi-GPU multi-node) mode -- Strategy A: a clean, non-overlapping
+ * 1D block-row partition. Each rank hands over only the rows it owns, fully
+ * assembled, in a global continuous numbering (first_row..last_row, 0-based
+ * inclusive). Because the partition does not overlap, cuDSS performs no
+ * cross-rank summation -- the Fortran caller already summed the shared
+ * interface rows into their owner (see CUDSS_AssembleOwnedRowsR). Reuses
+ * cudss_fsolve / cudss_ffree for the solve and teardown.
+ * ------------------------------------------------------------------------- */
+#ifdef HAVE_MPI
+
+/* Bind this process to one GPU, mapping node-local MPI rank -> device. MGMN
+ * wants one device per rank; without this, every rank on a node piles onto
+ * device 0. */
+static void cudss_bind_device(MPI_Comm comm)
+{
+  MPI_Comm shmcomm;
+  int grank, lrank, ndev = 0;
+
+  MPI_Comm_rank(comm, &grank);
+  MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, grank, MPI_INFO_NULL, &shmcomm);
+  MPI_Comm_rank(shmcomm, &lrank);
+  MPI_Comm_free(&shmcomm);
+
+  if (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0)
+    cudaSetDevice(lrank % ndev);
+}
+
+/* nglob/nnz_glob: global order and global nonzero count (cuDSS descriptor
+ * metadata, identical on every rank). nloc/nnzloc: the owned rows and their
+ * nonzeros this rank actually provides. rows: local CSR offsets (nloc+1,
+ * 1-based from Fortran). cols: GLOBAL column indices (1-based). first_row/
+ * last_row: 0-based inclusive global range of the owned block (empty rank:
+ * first_row > last_row). */
+static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
+    int nnzloc, int first_row, int last_row, const int *rows, const int *cols,
+    const double *vals, int mtype, MPI_Comm comm)
+{
+  ElmerCUDSS *ctx;
+  cudssMatrixType_t mt;
+  cudssMatrixViewType_t mv;
+
+  ctx = (ElmerCUDSS *)calloc(1, sizeof(ElmerCUDSS));
+  if (!ctx) { fprintf(stderr, "CUDSS_SolveSystem: out of host memory\n"); return NULL; }
+  ctx->n    = nloc;              /* the solve works on the owned block */
+  ctx->esz  = sizeof(double);
+  ctx->dist = 1;
+  ctx->comm = comm;
+
+  switch (mtype) {
+    case 2:  mt = CUDSS_MTYPE_SPD;     mv = CUDSS_MVIEW_UPPER; break;
+    default: mt = CUDSS_MTYPE_GENERAL; mv = CUDSS_MVIEW_FULL;  break;
+  }
+
+  cudss_bind_device(comm);
+
+  /* nloc/nnzloc can be 0 on an empty partition; keep device allocations >0. */
+  if (!cuda_ok(cudaMalloc((void **)&ctx->d_rows, (size_t)(nloc + 1) * sizeof(int)), "cudaMalloc(rows)") ||
+      !cuda_ok(cudaMalloc((void **)&ctx->d_cols, (size_t)(nnzloc > 0 ? nnzloc : 1) * sizeof(int)), "cudaMalloc(cols)") ||
+      !cuda_ok(cudaMalloc(&ctx->d_vals, (size_t)(nnzloc > 0 ? nnzloc : 1) * ctx->esz), "cudaMalloc(vals)") ||
+      !cuda_ok(cudaMalloc(&ctx->d_b, (size_t)(nloc > 0 ? nloc : 1) * ctx->esz), "cudaMalloc(b)") ||
+      !cuda_ok(cudaMalloc(&ctx->d_x, (size_t)(nloc > 0 ? nloc : 1) * ctx->esz), "cudaMalloc(x)")) {
+    cudss_teardown(ctx);
+    return NULL;
+  }
+
+  {
+    int *z_rows = (int *)malloc((size_t)(nloc + 1) * sizeof(int));
+    int *z_cols = (int *)malloc((size_t)(nnzloc > 0 ? nnzloc : 1) * sizeof(int));
+    int ok, i;
+
+    if (!z_rows || !z_cols) {
+      fprintf(stderr, "CUDSS_SolveSystem: out of host memory for index conversion\n");
+      free(z_rows); free(z_cols); cudss_teardown(ctx);
+      return NULL;
+    }
+
+    for (i = 0; i <= nloc; i++)  z_rows[i] = rows[i] - 1;   /* local offsets  -> 0-based */
+    for (i = 0; i < nnzloc; i++) z_cols[i] = cols[i] - 1;   /* global columns -> 0-based */
+
+    ok = cuda_ok(cudaMemcpy(ctx->d_rows, z_rows, (size_t)(nloc + 1) * sizeof(int), cudaMemcpyHostToDevice), "memcpy(rows)") &&
+         (nnzloc == 0 || cuda_ok(cudaMemcpy(ctx->d_cols, z_cols, (size_t)nnzloc * sizeof(int), cudaMemcpyHostToDevice), "memcpy(cols)")) &&
+         (nnzloc == 0 || cuda_ok(cudaMemcpy(ctx->d_vals, vals, (size_t)nnzloc * ctx->esz, cudaMemcpyHostToDevice), "memcpy(vals)"));
+
+    free(z_rows); free(z_cols);
+    if (!ok) { cudss_teardown(ctx); return NULL; }
+  }
+
+  if (!cudss_ok(cudssCreate(&ctx->handle), "cudssCreate") ||
+      !cudss_ok(cudssConfigCreate(&ctx->config), "cudssConfigCreate") ||
+      !cudss_ok(cudssDataCreate(ctx->handle, &ctx->data), "cudssDataCreate")) {
+    cudss_teardown(ctx);
+    return NULL;
+  }
+
+  /* Communication layer: the library name comes from the CUDSS_COMM_LIB
+   * environment variable (NULL here), and the communicator is handed to the
+   * data object. The comm layer dereferences a pointer to a live MPI_Comm, so
+   * we pass &ctx->comm, which outlives the solves. NOTE: confirm the size
+   * argument against your cuDSS version's sample -- it passes sizeof(MPI_Comm*)
+   * in some releases. */
+  if (!cudss_ok(cudssSetCommLayer(ctx->handle, NULL), "cudssSetCommLayer") ||
+      !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM,
+                    &ctx->comm, sizeof(ctx->comm)), "cudssDataSet(COMM)")) {
+    cudss_teardown(ctx);
+    return NULL;
+  }
+
+  /* Global descriptor (nglob x nglob, nnz_glob) with this rank's LOCAL arrays;
+   * SetDistributionRow1d tells cuDSS which global rows the local arrays are. */
+  if (!cudss_ok(cudssMatrixCreateCsr(&ctx->Amat, nglob, nglob, nnz_glob,
+                    ctx->d_rows, NULL, ctx->d_cols, ctx->d_vals,
+                    CUDSS_R_32I, CUDSS_R_32I, CUDSS_R_64F, mt, mv, CUDSS_BASE_ZERO),
+                "cudssMatrixCreateCsr") ||
+      !cudss_ok(cudssMatrixSetDistributionRow1d(ctx->Amat, first_row, last_row),
+                "cudssMatrixSetDistributionRow1d(A)")) {
+    cudss_teardown(ctx);
+    return NULL;
+  }
+
+  /* b and x share the matrix's owned-block distribution (no overlap). ld is the
+   * local leading dimension; for a single RHS the stride is immaterial. */
+  if (!cudss_ok(cudssMatrixCreateDn(&ctx->bmat, nglob, 1, nloc > 0 ? nloc : 1,
+                    ctx->d_b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn(b)") ||
+      !cudss_ok(cudssMatrixSetDistributionRow1d(ctx->bmat, first_row, last_row),
+                "cudssMatrixSetDistributionRow1d(b)") ||
+      !cudss_ok(cudssMatrixCreateDn(&ctx->xmat, nglob, 1, nloc > 0 ? nloc : 1,
+                    ctx->d_x, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn(x)") ||
+      !cudss_ok(cudssMatrixSetDistributionRow1d(ctx->xmat, first_row, last_row),
+                "cudssMatrixSetDistributionRow1d(x)")) {
+    cudss_teardown(ctx);
+    return NULL;
+  }
+
+  /* Analysis + factorization are collective over the communicator. */
+  if (!cudss_ok(cudssExecute(ctx->handle, CUDSS_PHASE_ANALYSIS, ctx->config, ctx->data,
+                    ctx->Amat, ctx->xmat, ctx->bmat), "cudssExecute(ANALYSIS)") ||
+      !cudss_ok(cudssExecute(ctx->handle, CUDSS_PHASE_FACTORIZATION, ctx->config, ctx->data,
+                    ctx->Amat, ctx->xmat, ctx->bmat), "cudssExecute(FACTORIZATION)")) {
+    cudss_teardown(ctx);
+    return NULL;
+  }
+
+  return ctx;
+}
+#endif /* HAVE_MPI */
+
+ElmerCUDSS *FC_FUNC_(cudss_dfactorize,CUDSS_DFACTORIZE)
+    (int *nglob, int *nnz_glob, int *nloc, int *nnzloc, int *first_row,
+     int *last_row, int *rows, int *cols, double *vals, int *mtype, int *fcomm)
+{
+#ifdef HAVE_MPI
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  return cudss_dfactorize_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
+      *last_row, rows, cols, vals, *mtype, comm);
+#else
+  (void)nglob; (void)nnz_glob; (void)nloc; (void)nnzloc; (void)first_row;
+  (void)last_row; (void)rows; (void)cols; (void)vals; (void)mtype; (void)fcomm;
+  fprintf(stderr, "CUDSS_SolveSystem: distributed (MGMN) cuDSS needs MPI\n");
+  return NULL;
+#endif
 }
 
 #endif /* HAVE_CUDSS */

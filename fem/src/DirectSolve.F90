@@ -698,13 +698,21 @@ CONTAINS
     END IF
   END IF
 
-  ! Single GPU, single MPI task. Nothing here looks at A % ParallelInfo or
-  ! builds a global numbering the way the Mumps paths do, so with more than one
-  ! task each would factorize its own local block and return an answer that is
-  ! wrong without saying so. Refuse instead of solving the wrong system.
+  ! More than one task: hand over to the distributed (MGMN) driver, which
+  ! builds the global continuous numbering and a clean non-overlapping block-row
+  ! partition the way the Mumps paths do. Only the real, general matrix type is
+  ! wired up so far; complex and SPD still fall through to the refusal below
+  ! rather than silently solving the wrong system.
   IF ( ParEnv % PEs > 1 ) THEN
+#ifdef HAVE_MPI
+    IF ( ASSOCIATED(A % ParallelInfo) .AND. .NOT. A % Complex ) THEN
+      CALL CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
+      RETURN
+    END IF
+#endif
     CALL Fatal('CUDSS_SolveSystem', &
-        'cuDSS Elmer interface is single-GPU and serial only.')
+        'cuDSS parallel mode so far supports only real general systems with '// &
+        'ParallelInfo; complex, SPD and the no-ParallelInfo case are not done.')
   END IF
 
   ! A complex system is stored by Elmer as a real one of twice the order,
@@ -885,6 +893,334 @@ CONTAINS
 #endif
 !------------------------------------------------------------------------------
   END SUBROUTINE CUDSS_SolveSystem
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Distributed (MGMN) cuDSS solve for a real, general system -- Strategy A.
+!> ContinuousNumbering gives each rank a contiguous range of global indices for
+!> the rows it owns; we assemble those owned rows fully (summing the shared
+!> interface rows into their owner), hand cuDSS a clean non-overlapping 1D
+!> block-row partition, and scatter the owned solution back with a parallel sum.
+!> Complex and SPD are not handled here yet (see CUDSS_SolveSystem's refusal).
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
+!------------------------------------------------------------------------------
+#ifdef HAVE_CUDSS
+#  if defined(ELMER_HAVE_MPI_MODULE)
+    USE mpi
+#  endif
+#endif
+    LOGICAL, OPTIONAL :: Free_Fact
+    TYPE(Solver_t) :: Solver
+    TYPE(Matrix_t) :: A
+    REAL(KIND=dp) :: x(*), b(*)
+
+#ifdef HAVE_CUDSS
+#  if defined(ELMER_HAVE_MPIF_HEADER)
+    INCLUDE 'mpif.h'
+#  endif
+    INTERFACE
+      FUNCTION cudss_dfactorize(nglob,nnz_glob,nloc,nnzloc,first_row,last_row, &
+          rows,cols,vals,mtype,fcomm) RESULT(cudss) BIND(c,NAME="cudss_dfactorize")
+        USE Types
+        INTEGER :: nglob,nnz_glob,nloc,nnzloc,first_row,last_row,mtype,fcomm
+        INTEGER :: rows(*), cols(*)
+        REAL(KIND=dp) :: vals(*)
+        INTEGER(KIND=AddrInt) :: cudss
+      END FUNCTION cudss_dfactorize
+
+      SUBROUTINE cudss_fsolve(cudss, n, x, b, status) BIND(c,NAME="cudss_fsolve")
+        USE Types
+        REAL(KIND=dp) :: x(*), b(*)
+        INTEGER :: n, status
+        INTEGER(KIND=AddrInt) :: cudss
+      END SUBROUTINE cudss_fsolve
+
+      SUBROUTINE cudss_ffree(cudss) BIND(c,NAME="cudss_ffree")
+        USE Types
+        INTEGER(KIND=AddrInt) :: cudss
+      END SUBROUTINE cudss_ffree
+    END INTERFACE
+
+    LOGICAL :: Factorize, FreeFactorize, Found
+    INTEGER :: n, i, nOwnLoc, gStartLoc, nGlob, nnzLoc, nnzGlob
+    INTEGER :: first_row, last_row, mtype, SolveOk, ierr
+    INTEGER, ALLOCATABLE :: Owner(:), Rloc(:), Cloc(:)
+    REAL(KIND=dp), ALLOCATABLE :: Vloc(:), bsum(:), bloc(:), xloc(:)
+
+    ! Free-only entry (matches the serial path's Free_Fact handling).
+    IF ( PRESENT(Free_Fact) ) THEN
+      IF ( Free_Fact ) THEN
+        IF ( A % Cudss/=0 ) THEN
+          CALL cudss_ffree(A % Cudss)
+          A % Cudss = 0
+        END IF
+        RETURN
+      END IF
+    END IF
+
+    n = A % NumberOfRows
+
+    ! Global continuous numbering. Owner(i)==1 marks the rows this rank owns;
+    ! they get the contiguous global range [gStartLoc+1, gStartLoc+nOwnLoc].
+    ! Recomputed every call so the owned-row / solution mapping is available on
+    ! solve-only calls too; it is deterministic, so it stays consistent with the
+    ! numbering the factorization was built from.
+    IF ( ASSOCIATED(A % Gorder) ) DEALLOCATE(A % Gorder)
+    ALLOCATE( A % Gorder(n), Owner(n) )
+    CALL ContinuousNumbering( A % ParallelInfo, A % Perm, A % Gorder, Owner, &
+            nOwn=nOwnLoc, gStart=gStartLoc )
+    CALL MPI_ALLREDUCE( SUM(Owner), nGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
+
+    first_row = gStartLoc                 ! 0-based, inclusive
+    last_row  = gStartLoc + nOwnLoc - 1   ! empty rank: last_row = first_row-1
+
+    mtype = 0   ! real general only in this draft
+
+    Factorize = ListGetLogical( Solver % Values, 'Linear System Refactorize', Found )
+    IF ( .NOT. Found ) Factorize = .TRUE.
+
+    IF ( Factorize .OR. A % Cudss==0 ) THEN
+      IF ( A % Cudss/=0 ) THEN
+        CALL cudss_ffree(A % Cudss)
+        A % Cudss = 0
+      END IF
+
+      ! Assemble the owned rows into one fully summed CSR with global column
+      ! indices. This is where the shared interface rows are summed into their
+      ! owner -- the clean partition does not overlap, so cuDSS does not sum.
+      CALL CUDSS_AssembleOwnedRowsR( A, Owner, nOwnLoc, gStartLoc, &
+              Rloc, Cloc, Vloc, nnzLoc )
+      CALL MPI_ALLREDUCE( nnzLoc, nnzGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
+
+      A % Cudss = cudss_dfactorize( nGlob, nnzGlob, nOwnLoc, nnzLoc, &
+              first_row, last_row, Rloc, Cloc, Vloc, mtype, A % Comm )
+      DEALLOCATE( Rloc, Cloc, Vloc )
+
+      IF ( A % Cudss == 0 ) &
+          CALL Fatal('CUDSS_SolveSystem','distributed cuDSS factorization failed.')
+    END IF
+
+    ! Right-hand side: ParallelSumVector makes every shared row hold the full,
+    ! summed value on all sharers; we then take the owned rows into the local
+    ! block. b itself is left untouched (work on a copy).
+    ALLOCATE( bsum(n), bloc(MAX(nOwnLoc,1)), xloc(MAX(nOwnLoc,1)) )
+    bsum(1:n) = b(1:n)
+    CALL ParallelSumVector( A, bsum )
+    DO i=1,n
+      IF ( Owner(i)==1 ) bloc(A % Gorder(i)-gStartLoc) = bsum(i)
+    END DO
+    DEALLOCATE( bsum )
+
+    CALL cudss_fsolve( A % Cudss, nOwnLoc, xloc, bloc, SolveOk )
+    IF ( SolveOk == 0 ) &
+        CALL Fatal('CUDSS_SolveSystem','distributed cuDSS solve failed.')
+
+    ! Scatter the owned solution onto our rows, then let the shared rows pick up
+    ! their owner's value (the non-owned rows are zero going into the sum, and
+    ! adding zero is exact), exactly as MumpsScatterSolutionR does.
+    x(1:n) = 0.0_dp
+    DO i=1,n
+      IF ( Owner(i)==1 ) x(i) = xloc(A % Gorder(i)-gStartLoc)
+    END DO
+    CALL ParallelSumVector( A, x(1:n) )
+
+    DEALLOCATE( bloc, xloc, Owner )
+
+    FreeFactorize = ListGetLogical( Solver % Values, &
+        'Linear System Free Factorization', Found )
+    IF ( .NOT. Found ) FreeFactorize = .TRUE.
+    IF ( Factorize .AND. FreeFactorize ) THEN
+      CALL cudss_ffree(A % Cudss)
+      A % Cudss = 0
+    END IF
+#else
+    CALL Fatal( 'CUDSS_DistSolveReal', 'cuDSS Solver has not been installed.' )
+#endif
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_DistSolveReal
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Build the fully assembled CSR of this rank's owned rows for the distributed
+!> cuDSS solve. Every local row is sent to the rank that owns it (owned rows go
+!> to self), tagged with global row and column indices; the owner accumulates
+!> all contributions, summing the partial interface rows that several
+!> partitions hold. Duplicate columns within a row are merged so the result is
+!> a clean CSR (global 1-based column indices, owned rows in global order).
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_AssembleOwnedRowsR( A, Owner, nOwnLoc, gStartLoc, &
+             Rloc, Cloc, Vloc, nnzLoc )
+!------------------------------------------------------------------------------
+#  if defined(ELMER_HAVE_MPI_MODULE)
+    USE mpi
+#  endif
+    TYPE(Matrix_t) :: A
+    INTEGER :: Owner(:), nOwnLoc, gStartLoc, nnzLoc
+    INTEGER, ALLOCATABLE :: Rloc(:), Cloc(:)
+    REAL(KIND=dp), ALLOCATABLE :: Vloc(:)
+#  if defined(ELMER_HAVE_MPIF_HEADER)
+    INCLUDE 'mpif.h'
+#  endif
+    INTEGER, POINTER :: nb(:)
+    INTEGER :: PEs, me, n, i, j, k, tgt, ierr, nsend, nrecv, lr, p, q, lo, hi, col, ndist
+    INTEGER, ALLOCATABLE :: scnt(:), sdsp(:), rcnt(:), rdsp(:), pos(:)
+    INTEGER, ALLOCATABLE :: sGrow(:), sGcol(:), rGrow(:), rGcol(:)
+    REAL(KIND=dp), ALLOCATABLE :: sVal(:), rVal(:)
+    INTEGER, ALLOCATABLE :: cnt(:), stageRow(:), stageCol(:)
+    REAL(KIND=dp), ALLOCATABLE :: stageVal(:)
+    REAL(KIND=dp) :: v
+!------------------------------------------------------------------------------
+    n   = A % NumberOfRows
+    PEs = ParEnv % PEs
+    me  = ParEnv % MyPE
+
+    ALLOCATE( scnt(PEs), sdsp(PEs), rcnt(PEs), rdsp(PEs), pos(PEs) )
+
+    ! Count entries bound for each row's owner (owned rows -> self).
+    scnt = 0
+    DO i=1,n
+      IF ( Owner(i)==1 ) THEN
+        tgt = me
+      ELSE
+        nb => A % ParallelInfo % NeighbourList(i) % Neighbours
+        tgt = nb(1)
+      END IF
+      scnt(tgt+1) = scnt(tgt+1) + ( A % Rows(i+1) - A % Rows(i) )
+    END DO
+
+    sdsp(1) = 0
+    DO i=2,PEs
+      sdsp(i) = sdsp(i-1) + scnt(i-1)
+    END DO
+    nsend = sdsp(PEs) + scnt(PEs)
+    ALLOCATE( sGrow(MAX(nsend,1)), sGcol(MAX(nsend,1)), sVal(MAX(nsend,1)) )
+
+    ! Pack (global row, global column, value) grouped by target rank.
+    pos = sdsp
+    DO i=1,n
+      IF ( Owner(i)==1 ) THEN
+        tgt = me
+      ELSE
+        nb => A % ParallelInfo % NeighbourList(i) % Neighbours
+        tgt = nb(1)
+      END IF
+      DO j=A % Rows(i), A % Rows(i+1)-1
+        pos(tgt+1) = pos(tgt+1) + 1
+        sGrow(pos(tgt+1)) = A % Gorder(i)
+        sGcol(pos(tgt+1)) = A % Gorder(A % Cols(j))
+        sVal (pos(tgt+1)) = A % Values(j)
+      END DO
+    END DO
+
+    CALL MPI_ALLTOALL( scnt, 1, MPI_INTEGER, rcnt, 1, MPI_INTEGER, A % Comm, ierr )
+    rdsp(1) = 0
+    DO i=2,PEs
+      rdsp(i) = rdsp(i-1) + rcnt(i-1)
+    END DO
+    nrecv = rdsp(PEs) + rcnt(PEs)
+
+    ALLOCATE( rGrow(MAX(nrecv,1)), rGcol(MAX(nrecv,1)), rVal(MAX(nrecv,1)) )
+    CALL MPI_ALLTOALLV( sGrow, scnt, sdsp, MPI_INTEGER, &
+                        rGrow, rcnt, rdsp, MPI_INTEGER, A % Comm, ierr )
+    CALL MPI_ALLTOALLV( sGcol, scnt, sdsp, MPI_INTEGER, &
+                        rGcol, rcnt, rdsp, MPI_INTEGER, A % Comm, ierr )
+    CALL MPI_ALLTOALLV( sVal, scnt, sdsp, MPI_DOUBLE_PRECISION, &
+                        rVal, rcnt, rdsp, MPI_DOUBLE_PRECISION, A % Comm, ierr )
+    DEALLOCATE( sGrow, sGcol, sVal )
+
+    ! Bin received entries by owned local row (global row - gStartLoc).
+    ALLOCATE( cnt(MAX(nOwnLoc,1)) )
+    cnt = 0
+    DO k=1,nrecv
+      lr = rGrow(k) - gStartLoc
+      IF ( lr < 1 .OR. lr > nOwnLoc ) &
+          CALL Fatal('CUDSS_AssembleOwnedRowsR', &
+              'Received a row this rank does not own; numbering is inconsistent.')
+      cnt(lr) = cnt(lr) + 1
+    END DO
+
+    ALLOCATE( stageRow(nOwnLoc+1) )
+    stageRow(1) = 1
+    DO lr=1,nOwnLoc
+      stageRow(lr+1) = stageRow(lr) + cnt(lr)
+    END DO
+
+    ALLOCATE( stageCol(MAX(nrecv,1)), stageVal(MAX(nrecv,1)) )
+    cnt = stageRow(1:nOwnLoc)          ! running insertion position per row
+    DO k=1,nrecv
+      lr = rGrow(k) - gStartLoc
+      stageCol(cnt(lr)) = rGcol(k)
+      stageVal(cnt(lr)) = rVal(k)
+      cnt(lr) = cnt(lr) + 1
+    END DO
+    DEALLOCATE( rGrow, rGcol, rVal )
+
+    ! Sort each row segment by column and count the distinct columns, so the
+    ! merged CSR can be sized exactly. Segments are small (partitions/elements
+    ! touching the dof), so an insertion sort is fine.
+    ALLOCATE( Rloc(nOwnLoc+1) )
+    nnzLoc = 0
+    DO lr=1,nOwnLoc
+      lo = stageRow(lr); hi = stageRow(lr+1)-1
+      CALL CUDSS_SortRowSegment( stageCol, stageVal, lo, hi )
+      IF ( hi >= lo ) THEN
+        ndist = 1
+        DO p=lo+1,hi
+          IF ( stageCol(p) /= stageCol(p-1) ) ndist = ndist + 1
+        END DO
+        nnzLoc = nnzLoc + ndist
+      END IF
+    END DO
+
+    ! Emit the merged CSR, summing duplicate columns.
+    ALLOCATE( Cloc(MAX(nnzLoc,1)), Vloc(MAX(nnzLoc,1)) )
+    Rloc(1) = 1
+    q = 0
+    DO lr=1,nOwnLoc
+      lo = stageRow(lr); hi = stageRow(lr+1)-1
+      p = lo
+      DO WHILE ( p <= hi )
+        col = stageCol(p); v = stageVal(p); p = p + 1
+        DO WHILE ( p <= hi .AND. stageCol(p) == col )
+          v = v + stageVal(p); p = p + 1
+        END DO
+        q = q + 1
+        Cloc(q) = col      ! global 1-based column (C side rebases to 0)
+        Vloc(q) = v
+      END DO
+      Rloc(lr+1) = q + 1
+    END DO
+
+    DEALLOCATE( stageCol, stageVal, stageRow, cnt, scnt, sdsp, rcnt, rdsp, pos )
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_AssembleOwnedRowsR
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Insertion sort of one CSR row segment [lo,hi] ascending by column index,
+!> carrying the matching values. Used by CUDSS_AssembleOwnedRowsR to merge
+!> duplicate columns; row segments are short, so insertion sort suffices.
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_SortRowSegment( col, val, lo, hi )
+!------------------------------------------------------------------------------
+    INTEGER :: col(:), lo, hi
+    REAL(KIND=dp) :: val(:)
+    INTEGER :: p, q, ckey
+    REAL(KIND=dp) :: vkey
+!------------------------------------------------------------------------------
+    DO p=lo+1,hi
+      ckey = col(p); vkey = val(p); q = p - 1
+      DO WHILE ( q >= lo .AND. col(q) > ckey )
+        col(q+1) = col(q); val(q+1) = val(q); q = q - 1
+      END DO
+      col(q+1) = ckey; val(q+1) = vkey
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_SortRowSegment
 !------------------------------------------------------------------------------
 
 
