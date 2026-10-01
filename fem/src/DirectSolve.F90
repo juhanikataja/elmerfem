@@ -700,19 +700,23 @@ CONTAINS
 
   ! More than one task: hand over to the distributed (MGMN) driver, which
   ! builds the global continuous numbering and a clean non-overlapping block-row
-  ! partition the way the Mumps paths do. Only the real, general matrix type is
-  ! wired up so far; complex and SPD still fall through to the refusal below
-  ! rather than silently solving the wrong system.
+  ! partition the way the Mumps paths do. Complex systems are carried through as
+  ! their equivalent real 2x2-block form (the ERF): Elmer's ParallelInfo and
+  ! ContinuousNumbering already live in the 2n scalar-row space, so the real
+  ! driver handles them unchanged -- at the usual ~2x cost of factorizing the
+  ! real form instead of the true complex one. A dedicated complex interface
+  ! would avoid that cost but is a separate follow-up. SPD is not special-cased;
+  ! the driver always uses the general matrix type.
   IF ( ParEnv % PEs > 1 ) THEN
 #ifdef HAVE_MPI
-    IF ( ASSOCIATED(A % ParallelInfo) .AND. .NOT. A % Complex ) THEN
+    IF ( ASSOCIATED(A % ParallelInfo) ) THEN
       CALL CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
       RETURN
     END IF
 #endif
     CALL Fatal('CUDSS_SolveSystem', &
-        'cuDSS parallel mode so far supports only real general systems with '// &
-        'ParallelInfo; complex, SPD and the no-ParallelInfo case are not done.')
+        'cuDSS parallel mode requires ParallelInfo (built by ParallelInitMatrix); '// &
+        'the no-ParallelInfo parallel case is not implemented.')
   END IF
 
   ! A complex system is stored by Elmer as a real one of twice the order,
@@ -897,12 +901,16 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
-!> Distributed (MGMN) cuDSS solve for a real, general system -- Strategy A.
+!> Distributed (MGMN) cuDSS solve for a general real system -- Strategy A.
 !> ContinuousNumbering gives each rank a contiguous range of global indices for
 !> the rows it owns; we assemble those owned rows fully (summing the shared
 !> interface rows into their owner), hand cuDSS a clean non-overlapping 1D
 !> block-row partition, and scatter the owned solution back with a parallel sum.
-!> Complex and SPD are not handled here yet (see CUDSS_SolveSystem's refusal).
+!> Complex systems arrive here as their equivalent real 2x2-block form: Elmer's
+!> ParallelInfo numbers the 2n scalar rows, so nothing below needs to know the
+!> system is complex -- each scalar row is just a dof. This costs ~2x compared
+!> with factorizing the true complex system. SPD is not special-cased; the
+!> matrix type is always general (correct for the ERF, which is non-symmetric).
 !------------------------------------------------------------------------------
   SUBROUTINE CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
 !------------------------------------------------------------------------------
