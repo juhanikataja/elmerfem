@@ -347,13 +347,22 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
 
   /* Communication layer: the library name comes from the CUDSS_COMM_LIB
    * environment variable (NULL here), and the communicator is handed to the
-   * data object. The comm layer dereferences a pointer to a live MPI_Comm, so
-   * we pass &ctx->comm, which outlives the solves. NOTE: confirm the size
-   * argument against your cuDSS version's sample -- it passes sizeof(MPI_Comm*)
-   * in some releases. */
+   * data object. cuDSS stores the POINTER we pass and dereferences it later, so
+   * the value is &ctx->comm (a live MPI_Comm that outlives the solves) and the
+   * size is that of the pointer, sizeof(MPI_Comm*), not of the MPI_Comm.
+   *
+   * Recent cuDSS (which is what rejects the old single CUDSS_DATA_COMM) splits
+   * the communicator into a device and a host one. With the MPI (openmpi) comm
+   * layer both backends are MPI, so both get the same MPI communicator. For an
+   * NCCL device backend, CUDSS_DATA_COMM_DEVICE would instead take an
+   * ncclComm_t and only CUDSS_DATA_COMM_HOST would stay MPI. If you build
+   * against an older cuDSS that still has the single CUDSS_DATA_COMM, replace
+   * the two calls below with one on CUDSS_DATA_COMM. */
   if (!cudss_ok(cudssSetCommLayer(ctx->handle, NULL), "cudssSetCommLayer") ||
-      !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM,
-                    &ctx->comm, sizeof(ctx->comm)), "cudssDataSet(COMM)")) {
+      !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM_DEVICE,
+                    &ctx->comm, sizeof(&ctx->comm)), "cudssDataSet(COMM_DEVICE)") ||
+      !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM_HOST,
+                    &ctx->comm, sizeof(&ctx->comm)), "cudssDataSet(COMM_HOST)")) {
     cudss_teardown(ctx);
     return NULL;
   }
