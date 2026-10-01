@@ -286,16 +286,17 @@ static void cudss_bind_device(MPI_Comm comm)
  * first_row > last_row). */
 static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
     int nnzloc, int first_row, int last_row, const int *rows, const int *cols,
-    const double *vals, int mtype, MPI_Comm comm)
+    const void *vals, int mtype, int is_complex, MPI_Comm comm)
 {
   ElmerCUDSS *ctx;
   cudssMatrixType_t mt;
   cudssMatrixViewType_t mv;
+  cudssDataType_t vt = is_complex ? CUDSS_C_64F : CUDSS_R_64F;
 
   ctx = (ElmerCUDSS *)calloc(1, sizeof(ElmerCUDSS));
   if (!ctx) { fprintf(stderr, "CUDSS_SolveSystem: out of host memory\n"); return NULL; }
   ctx->n    = nloc;              /* the solve works on the owned block */
-  ctx->esz  = sizeof(double);
+  ctx->esz  = is_complex ? 2 * sizeof(double) : sizeof(double);
   ctx->dist = 1;
   ctx->comm = comm;
 
@@ -368,10 +369,11 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
   }
 
   /* Global descriptor (nglob x nglob, nnz_glob) with this rank's LOCAL arrays;
-   * SetDistributionRow1d tells cuDSS which global rows the local arrays are. */
+   * SetDistributionRow1d tells cuDSS which global rows the local arrays are. For
+   * a complex system nglob/nloc/nnz are complex counts and vt is CUDSS_C_64F. */
   if (!cudss_ok(cudssMatrixCreateCsr(&ctx->Amat, nglob, nglob, nnz_glob,
                     ctx->d_rows, NULL, ctx->d_cols, ctx->d_vals,
-                    CUDSS_R_32I, CUDSS_R_32I, CUDSS_R_64F, mt, mv, CUDSS_BASE_ZERO),
+                    CUDSS_R_32I, CUDSS_R_32I, vt, mt, mv, CUDSS_BASE_ZERO),
                 "cudssMatrixCreateCsr") ||
       !cudss_ok(cudssMatrixSetDistributionRow1d(ctx->Amat, first_row, last_row),
                 "cudssMatrixSetDistributionRow1d(A)")) {
@@ -382,11 +384,11 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
   /* b and x share the matrix's owned-block distribution (no overlap). ld is the
    * local leading dimension; for a single RHS the stride is immaterial. */
   if (!cudss_ok(cudssMatrixCreateDn(&ctx->bmat, nglob, 1, nloc > 0 ? nloc : 1,
-                    ctx->d_b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn(b)") ||
+                    ctx->d_b, vt, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn(b)") ||
       !cudss_ok(cudssMatrixSetDistributionRow1d(ctx->bmat, first_row, last_row),
                 "cudssMatrixSetDistributionRow1d(b)") ||
       !cudss_ok(cudssMatrixCreateDn(&ctx->xmat, nglob, 1, nloc > 0 ? nloc : 1,
-                    ctx->d_x, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn(x)") ||
+                    ctx->d_x, vt, CUDSS_LAYOUT_COL_MAJOR), "cudssMatrixCreateDn(x)") ||
       !cudss_ok(cudssMatrixSetDistributionRow1d(ctx->xmat, first_row, last_row),
                 "cudssMatrixSetDistributionRow1d(x)")) {
     cudss_teardown(ctx);
@@ -413,7 +415,26 @@ ElmerCUDSS *FC_FUNC_(cudss_dfactorize,CUDSS_DFACTORIZE)
 #ifdef HAVE_MPI
   MPI_Comm comm = MPI_Comm_f2c(*fcomm);
   return cudss_dfactorize_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
-      *last_row, rows, cols, vals, *mtype, comm);
+      *last_row, rows, cols, vals, *mtype, 0, comm);
+#else
+  (void)nglob; (void)nnz_glob; (void)nloc; (void)nnzloc; (void)first_row;
+  (void)last_row; (void)rows; (void)cols; (void)vals; (void)mtype; (void)fcomm;
+  fprintf(stderr, "CUDSS_SolveSystem: distributed (MGMN) cuDSS needs MPI\n");
+  return NULL;
+#endif
+}
+
+/* Complex counterpart: the matrix is a complex CSR of order n (not Elmer's
+ * real 2n), vals holds 2*nnzloc interleaved (re,im) doubles -- i.e. Fortran
+ * COMPLEX(KIND=dp), layout-compatible with cuDoubleComplex. */
+ElmerCUDSS *FC_FUNC_(cudss_zdfactorize,CUDSS_ZDFACTORIZE)
+    (int *nglob, int *nnz_glob, int *nloc, int *nnzloc, int *first_row,
+     int *last_row, int *rows, int *cols, double *vals, int *mtype, int *fcomm)
+{
+#ifdef HAVE_MPI
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  return cudss_dfactorize_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
+      *last_row, rows, cols, vals, *mtype, 1, comm);
 #else
   (void)nglob; (void)nnz_glob; (void)nloc; (void)nnzloc; (void)first_row;
   (void)last_row; (void)rows; (void)cols; (void)vals; (void)mtype; (void)fcomm;

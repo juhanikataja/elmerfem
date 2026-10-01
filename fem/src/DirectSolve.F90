@@ -700,17 +700,19 @@ CONTAINS
 
   ! More than one task: hand over to the distributed (MGMN) driver, which
   ! builds the global continuous numbering and a clean non-overlapping block-row
-  ! partition the way the Mumps paths do. Complex systems are carried through as
-  ! their equivalent real 2x2-block form (the ERF): Elmer's ParallelInfo and
-  ! ContinuousNumbering already live in the 2n scalar-row space, so the real
-  ! driver handles them unchanged -- at the usual ~2x cost of factorizing the
-  ! real form instead of the true complex one. A dedicated complex interface
-  ! would avoid that cost but is a separate follow-up. SPD is not special-cased;
-  ! the driver always uses the general matrix type.
+  ! partition the way the Mumps paths do. A complex system goes to the complex
+  ! driver, which factorizes the true order-n complex system (half the size of
+  ! the real 2x2-block form); if its blocks do not number cleanly it falls back
+  ! to the real-ERF driver. SPD is not special-cased; both drivers use the
+  ! general matrix type.
   IF ( ParEnv % PEs > 1 ) THEN
 #ifdef HAVE_MPI
     IF ( ASSOCIATED(A % ParallelInfo) ) THEN
-      CALL CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
+      IF ( A % Complex ) THEN
+        CALL CUDSS_DistSolveComplex( Solver, A, x, b, Free_Fact )
+      ELSE
+        CALL CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
+      END IF
       RETURN
     END IF
 #endif
@@ -1048,6 +1050,232 @@ CONTAINS
 #endif
 !------------------------------------------------------------------------------
   END SUBROUTINE CUDSS_DistSolveReal
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Distributed (MGMN) cuDSS solve for a complex system, factorizing the true
+!> order-n complex system rather than its real 2x2-block form. The owned rows
+!> are assembled in the 2n scalar-row space exactly as the real driver does
+!> (reusing CUDSS_AssembleOwnedRowsR), then the owned block is packed into a
+!> complex CSR of half the order (CUDSS_PackOwnedComplex) and handed to cuDSS as
+!> CUDSS_C_64F. This needs each complex dof's two scalar rows to be owned
+!> together and numbered consecutively, so that a rank's owned scalar-row base
+!> and count are both even -- the same condition ZMumps checks. When that does
+!> not hold (reduced across all ranks, since the choice must be unanimous), it
+!> falls back to the real-ERF driver.
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_DistSolveComplex( Solver, A, x, b, Free_Fact )
+!------------------------------------------------------------------------------
+#ifdef HAVE_CUDSS
+#  if defined(ELMER_HAVE_MPI_MODULE)
+    USE mpi
+#  endif
+#endif
+    LOGICAL, OPTIONAL :: Free_Fact
+    TYPE(Solver_t) :: Solver
+    TYPE(Matrix_t) :: A
+    REAL(KIND=dp) :: x(*), b(*)
+
+#ifdef HAVE_CUDSS
+#  if defined(ELMER_HAVE_MPIF_HEADER)
+    INCLUDE 'mpif.h'
+#  endif
+    INTERFACE
+      FUNCTION cudss_zdfactorize(nglob,nnz_glob,nloc,nnzloc,first_row,last_row, &
+          rows,cols,vals,mtype,fcomm) RESULT(cudss) BIND(c,NAME="cudss_zdfactorize")
+        USE Types
+        INTEGER :: nglob,nnz_glob,nloc,nnzloc,first_row,last_row,mtype,fcomm
+        INTEGER :: rows(*), cols(*)
+        COMPLEX(KIND=dp) :: vals(*)
+        INTEGER(KIND=AddrInt) :: cudss
+      END FUNCTION cudss_zdfactorize
+
+      SUBROUTINE cudss_zsolve(cudss, n, x, b, status) BIND(c,NAME="cudss_zsolve")
+        USE Types
+        COMPLEX(KIND=dp) :: x(*), b(*)
+        INTEGER :: n, status
+        INTEGER(KIND=AddrInt) :: cudss
+      END SUBROUTINE cudss_zsolve
+
+      SUBROUTINE cudss_ffree(cudss) BIND(c,NAME="cudss_ffree")
+        USE Types
+        INTEGER(KIND=AddrInt) :: cudss
+      END SUBROUTINE cudss_ffree
+    END INTERFACE
+
+    LOGICAL :: Factorize, FreeFactorize, Found
+    INTEGER :: n, i, lc, nOwnLoc, gStartLoc, nOwnC, gStartC, nGlob, nGlobC
+    INTEGER :: nnzLoc, nnzLocC, nnzGlobC, first_row, last_row, mtype, SolveOk, ierr
+    INTEGER :: evenLoc, evenAll
+    INTEGER, ALLOCATABLE :: Owner(:), Rloc(:), Cloc(:), ZRloc(:), ZCloc(:)
+    REAL(KIND=dp), ALLOCATABLE :: Vloc(:), bsum(:)
+    COMPLEX(KIND=dp), ALLOCATABLE :: ZVloc(:), zbloc(:), zxloc(:)
+
+    ! Free-only entry.
+    IF ( PRESENT(Free_Fact) ) THEN
+      IF ( Free_Fact ) THEN
+        IF ( A % Cudss/=0 ) THEN
+          CALL cudss_ffree(A % Cudss)
+          A % Cudss = 0
+        END IF
+        RETURN
+      END IF
+    END IF
+
+    n = A % NumberOfRows
+
+    ! Numbering runs in the 2n scalar-row space, just as for the real driver;
+    ! Owner(i)==1 marks the scalar rows this rank owns.
+    IF ( ASSOCIATED(A % Gorder) ) DEALLOCATE(A % Gorder)
+    ALLOCATE( A % Gorder(n), Owner(n) )
+    CALL ContinuousNumbering( A % ParallelInfo, A % Perm, A % Gorder, Owner, &
+            nOwn=nOwnLoc, gStart=gStartLoc )
+
+    ! Complex blocks need an even owned base and count on every rank; the choice
+    ! must be unanimous or the collective factorize would diverge. If it does not
+    ! hold everywhere, fall back to the real-ERF driver (which redoes the
+    ! numbering, harmlessly, since it is deterministic).
+    evenLoc = 0
+    IF ( MODULO(gStartLoc,2)==0 .AND. MODULO(nOwnLoc,2)==0 ) evenLoc = 1
+    CALL MPI_ALLREDUCE( evenLoc, evenAll, 1, MPI_INTEGER, MPI_MIN, A % Comm, ierr )
+    IF ( evenAll == 0 ) THEN
+      DEALLOCATE( Owner )
+      CALL Info('CUDSS_SolveSystem', &
+          'Complex blocks do not number cleanly; using the real 2x2-block form.', Level=6)
+      CALL CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
+      RETURN
+    END IF
+
+    CALL MPI_ALLREDUCE( SUM(Owner), nGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
+    nOwnC   = nOwnLoc / 2
+    gStartC = gStartLoc / 2
+    nGlobC  = nGlob / 2
+
+    first_row = gStartC                 ! 0-based complex, inclusive
+    last_row  = gStartC + nOwnC - 1
+
+    mtype = 0   ! general (the complex systems Elmer sends here are not Hermitian)
+
+    Factorize = ListGetLogical( Solver % Values, 'Linear System Refactorize', Found )
+    IF ( .NOT. Found ) Factorize = .TRUE.
+
+    IF ( Factorize .OR. A % Cudss==0 ) THEN
+      IF ( A % Cudss/=0 ) THEN
+        CALL cudss_ffree(A % Cudss)
+        A % Cudss = 0
+      END IF
+
+      ! Assemble the owned scalar rows (real, summed), then pack the 2x2 blocks
+      ! into a complex CSR of order nOwnC.
+      CALL CUDSS_AssembleOwnedRowsR( A, Owner, nOwnLoc, gStartLoc, &
+              Rloc, Cloc, Vloc, nnzLoc )
+      CALL CUDSS_PackOwnedComplex( Rloc, Cloc, Vloc, nOwnC, &
+              ZRloc, ZCloc, ZVloc, nnzLocC )
+      DEALLOCATE( Rloc, Cloc, Vloc )
+
+      CALL MPI_ALLREDUCE( nnzLocC, nnzGlobC, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
+
+      A % Cudss = cudss_zdfactorize( nGlobC, nnzGlobC, nOwnC, nnzLocC, &
+              first_row, last_row, ZRloc, ZCloc, ZVloc, mtype, A % Comm )
+      DEALLOCATE( ZRloc, ZCloc, ZVloc )
+
+      IF ( A % Cudss == 0 ) &
+          CALL Fatal('CUDSS_SolveSystem','distributed complex cuDSS factorization failed.')
+    END IF
+
+    ! Right-hand side: sum shared contributions in the real 2n vector, then pack
+    ! each owned block's (Re,Im) scalar pair into one complex entry.
+    ALLOCATE( bsum(n), zbloc(MAX(nOwnC,1)), zxloc(MAX(nOwnC,1)) )
+    bsum(1:n) = b(1:n)
+    CALL ParallelSumVector( A, bsum )
+    DO i=1,n,2                                  ! odd scalar rows = block first rows
+      IF ( Owner(i)==1 ) THEN
+        lc = (A % Gorder(i)+1)/2 - gStartC      ! local complex row
+        zbloc(lc) = CMPLX( bsum(i), bsum(i+1), KIND=dp )
+      END IF
+    END DO
+    DEALLOCATE( bsum )
+
+    CALL cudss_zsolve( A % Cudss, nOwnC, zxloc, zbloc, SolveOk )
+    IF ( SolveOk == 0 ) &
+        CALL Fatal('CUDSS_SolveSystem','distributed complex cuDSS solve failed.')
+
+    ! Scatter the owned solution back into the real 2n vector (Re,Im per block),
+    ! then let the shared rows pick up their owner's value.
+    x(1:n) = 0.0_dp
+    DO i=1,n,2
+      IF ( Owner(i)==1 ) THEN
+        lc = (A % Gorder(i)+1)/2 - gStartC
+        x(i)   = REAL( zxloc(lc), KIND=dp )
+        x(i+1) = AIMAG( zxloc(lc) )
+      END IF
+    END DO
+    CALL ParallelSumVector( A, x(1:n) )
+
+    DEALLOCATE( zbloc, zxloc, Owner )
+
+    FreeFactorize = ListGetLogical( Solver % Values, &
+        'Linear System Free Factorization', Found )
+    IF ( .NOT. Found ) FreeFactorize = .TRUE.
+    IF ( Factorize .AND. FreeFactorize ) THEN
+      CALL cudss_ffree(A % Cudss)
+      A % Cudss = 0
+    END IF
+#else
+    CALL Fatal( 'CUDSS_DistSolveComplex', 'cuDSS Solver has not been installed.' )
+#endif
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_DistSolveComplex
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Pack an owned-block real 2x2 CSR (scalar-row space, as produced by
+!> CUDSS_AssembleOwnedRowsR) into a complex CSR of order nOwnC. Only the odd
+!> (first) scalar row of each block is read: Elmer stores each complex entry
+!> a+bi as the real block [[a,-b],[b,a]], so the odd row holds, for each complex
+!> column m, the pair (col 2m-1 = a, col 2m = -b) in adjacent, column-sorted
+!> positions. The complex value is CMPLX(a,-(-b)) = a+bi and the complex column
+!> is (2m-1+1)/2 = m, exactly as ZMumps_SolveSystem / the serial cuDSS path do.
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_PackOwnedComplex( Rloc, Cloc, Vloc, nOwnC, &
+             ZRloc, ZCloc, ZVloc, nnzLocC )
+!------------------------------------------------------------------------------
+    INTEGER :: Rloc(:), Cloc(:), nOwnC, nnzLocC
+    INTEGER, ALLOCATABLE :: ZRloc(:), ZCloc(:)
+    REAL(KIND=dp) :: Vloc(:)
+    COMPLEX(KIND=dp), ALLOCATABLE :: ZVloc(:)
+    INTEGER :: kc, p, hi, q, nnzR
+!------------------------------------------------------------------------------
+    ! Complex nnz = half the real nnz of the odd rows. The odd scalar row of
+    ! block kc is local row 2*kc-1.
+    nnzR = 0
+    DO kc=1,nOwnC
+      nnzR = nnzR + ( Rloc(2*kc) - Rloc(2*kc-1) )
+    END DO
+    nnzLocC = nnzR / 2
+
+    ALLOCATE( ZRloc(nOwnC+1), ZCloc(MAX(nnzLocC,1)), ZVloc(MAX(nnzLocC,1)) )
+    ZRloc(1) = 1
+    q = 0
+    DO kc=1,nOwnC
+      p  = Rloc(2*kc-1)
+      hi = Rloc(2*kc) - 1
+      DO WHILE ( p < hi )
+        ! Expect the ERF pair: col 2m-1 (a) immediately followed by col 2m (-b).
+        IF ( Cloc(p+1) /= Cloc(p)+1 .OR. MODULO(Cloc(p),2)/=1 ) &
+            CALL Fatal('CUDSS_PackOwnedComplex', &
+                'Owned real block is not in 2x2 ERF pairing; cannot pack to complex.')
+        q = q + 1
+        ZCloc(q) = (Cloc(p)+1)/2                         ! global complex column (1-based)
+        ZVloc(q) = CMPLX( Vloc(p), -Vloc(p+1), KIND=dp ) ! a + b i
+        p = p + 2
+      END DO
+      ZRloc(kc+1) = q + 1
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_PackOwnedComplex
 !------------------------------------------------------------------------------
 
 
