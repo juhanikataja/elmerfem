@@ -301,7 +301,6 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
   if (!ctx) { fprintf(stderr, "CUDSS_SolveSystem: out of host memory\n"); return NULL; }
   ctx->n    = nloc;              /* the solve works on the owned block */
   ctx->esz  = is_complex ? 2 * sizeof(double) : sizeof(double);
-  ctx->dist = 1;
   ctx->comm = comm;
 
   switch (mtype) {
