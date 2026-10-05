@@ -44,7 +44,6 @@ typedef struct {
 #ifdef HAVE_MPI
   /* MGMN only: kept alive for the whole factorization because the cuDSS
    * communication layer holds a pointer to this MPI_Comm, not a copy. */
-  int      dist;
   MPI_Comm comm;
 #endif
 } ElmerCUDSS;
@@ -114,8 +113,14 @@ static ElmerCUDSS *cudss_factorize_impl(int n, int nnz, const int *rows,
   vt = is_complex ? CUDSS_C_64F : CUDSS_R_64F;
 
   switch (mtype) {
-    case 2:  mt = CUDSS_MTYPE_SPD;     mv = CUDSS_MVIEW_UPPER; break;
-    default: mt = CUDSS_MTYPE_GENERAL; mv = CUDSS_MVIEW_FULL;  break;
+    case 2:  
+      mt = CUDSS_MTYPE_SPD;     
+      mv = CUDSS_MVIEW_UPPER; 
+      break;
+    default: 
+      mt = CUDSS_MTYPE_GENERAL; 
+      mv = CUDSS_MVIEW_FULL;  
+      break;
   }
 
   if (!cuda_ok(cudaMalloc((void **)&ctx->d_rows, (size_t)(n + 1) * sizeof(int)), "cudaMalloc(rows)") ||
@@ -251,19 +256,18 @@ void FC_FUNC_(cudss_ffree,CUDSS_FFREE)(ElmerCUDSS **handle)
 }
 
 /* ------------------------------------------------------------------------- *
- * MGMN (multi-GPU multi-node) mode -- Strategy A: a clean, non-overlapping
- * 1D block-row partition. Each rank hands over only the rows it owns, fully
- * assembled, in a global continuous numbering (first_row..last_row, 0-based
- * inclusive). Because the partition does not overlap, cuDSS performs no
- * cross-rank summation -- the Fortran caller already summed the shared
- * interface rows into their owner (see CUDSS_AssembleOwnedRowsR). Reuses
- * cudss_fsolve / cudss_ffree for the solve and teardown.
+ * CuDSS multi-GPU multi-node mode
+ *
+ * Each rank is assumed hold complete fully assembled rows 
+ * and there is no overlap and numbering must be contiguous.
+ *
+ * Reuses cudss_fsolve() and cudss_ffree() 
  * ------------------------------------------------------------------------- */
 #ifdef HAVE_MPI
 
-/* Bind this process to one GPU, mapping node-local MPI rank -> device. MGMN
- * wants one device per rank; without this, every rank on a node piles onto
- * device 0. */
+/* 
+ * Distribute devices on node to node local ranks in round-robin manner.
+ * */
 static void cudss_bind_device(MPI_Comm comm)
 {
   MPI_Comm shmcomm;
@@ -301,8 +305,14 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
   ctx->comm = comm;
 
   switch (mtype) {
-    case 2:  mt = CUDSS_MTYPE_SPD;     mv = CUDSS_MVIEW_UPPER; break;
-    default: mt = CUDSS_MTYPE_GENERAL; mv = CUDSS_MVIEW_FULL;  break;
+    case 2:  
+      mt = CUDSS_MTYPE_SPD;
+      mv = CUDSS_MVIEW_UPPER;
+      break;
+    default: 
+      mt = CUDSS_MTYPE_GENERAL; 
+      mv = CUDSS_MVIEW_FULL;
+      break;
   }
 
   cudss_bind_device(comm);
@@ -317,6 +327,8 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
     return NULL;
   }
 
+  /* Modify local rows and offsets to 0-based indexing and copy to device. 
+   * TODO: Modify on device to get rid of extra memory copy. */
   {
     int *z_rows = (int *)malloc((size_t)(nloc + 1) * sizeof(int));
     int *z_cols = (int *)malloc((size_t)(nnzloc > 0 ? nnzloc : 1) * sizeof(int));
@@ -328,8 +340,8 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
       return NULL;
     }
 
-    for (i = 0; i <= nloc; i++)  z_rows[i] = rows[i] - 1;   /* local offsets  -> 0-based */
-    for (i = 0; i < nnzloc; i++) z_cols[i] = cols[i] - 1;   /* global columns -> 0-based */
+    for (i = 0; i <= nloc; i++)  z_rows[i] = rows[i] - 1;
+    for (i = 0; i < nnzloc; i++) z_cols[i] = cols[i] - 1;
 
     ok = cuda_ok(cudaMemcpy(ctx->d_rows, z_rows, (size_t)(nloc + 1) * sizeof(int), cudaMemcpyHostToDevice), "memcpy(rows)") &&
          (nnzloc == 0 || cuda_ok(cudaMemcpy(ctx->d_cols, z_cols, (size_t)nnzloc * sizeof(int), cudaMemcpyHostToDevice), "memcpy(cols)")) &&
