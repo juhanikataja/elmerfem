@@ -330,7 +330,7 @@ IF(WITH_CUDSS)
 
     add_library(elmer_cudss_commlayer SHARED ${CUDSS_COMMLAYER_SRC_MPI})
     target_include_directories(elmer_cudss_commlayer PRIVATE ${CUDA_INCLUDE_DIR})
-    target_link_libraries(elmer_cudss_commlayer PRIVATE MPI::MPI_C CUDA::cudaart)
+    target_link_libraries(elmer_cudss_commlayer PRIVATE MPI::MPI_C CUDA::cudart)
     install(TARGETS elmer_cudss_commlayer LIBRARY DESTINATION ${ELMER_INSTALL_LIB_DIR})
   ENDIF(CUDSS_COMMLAYER_SRC_MPI)
 ENDIF()
