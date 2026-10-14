@@ -698,13 +698,6 @@ CONTAINS
     END IF
   END IF
 
-  ! More than one task: hand over to the distributed (MGMN) driver, which
-  ! builds the global continuous numbering and a clean non-overlapping block-row
-  ! partition the way the Mumps paths do. A complex system goes to the complex
-  ! driver, which factorizes the true order-n complex system (half the size of
-  ! the real 2x2-block form); if its blocks do not number cleanly it falls back
-  ! to the real-ERF driver. SPD is not special-cased; both drivers use the
-  ! general matrix type.
   IF ( ParEnv % PEs > 1 ) THEN
 #ifdef HAVE_MPI
     IF ( ASSOCIATED(A % ParallelInfo) ) THEN
@@ -903,7 +896,10 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
-!> Distributed (MGMN) cuDSS solve for a general real system -- Strategy A.
+!> Distributed (MGMN) cuDSS solve for a general real system
+!> Ranks are assigned contiguous range of global indices with ContinuousNumbering 
+!> for the rows they own. Then cuDSS receives non-overlapping block-row partition.
+  
 !> ContinuousNumbering gives each rank a contiguous range of global indices for
 !> the rows it owns; we assemble those owned rows fully (summing the shared
 !> interface rows into their owner), hand cuDSS a clean non-overlapping 1D
@@ -946,11 +942,6 @@ CONTAINS
         INTEGER :: n, status
         INTEGER(KIND=AddrInt) :: cudss
       END SUBROUTINE cudss_fsolve
-
-      SUBROUTINE cudss_ffree(cudss) BIND(c,NAME="cudss_ffree")
-        USE Types
-        INTEGER(KIND=AddrInt) :: cudss
-      END SUBROUTINE cudss_ffree
     END INTERFACE
 
     LOGICAL :: Factorize, FreeFactorize, Found
@@ -962,26 +953,15 @@ CONTAINS
     ! Free-only entry (matches the serial path's Free_Fact handling).
     IF ( PRESENT(Free_Fact) ) THEN
       IF ( Free_Fact ) THEN
-        IF ( A % Cudss/=0 ) THEN
-          CALL cudss_ffree(A % Cudss)
-          A % Cudss = 0
-        END IF
+        CALL CUDSS_FreeHandle( A )
         RETURN
       END IF
     END IF
 
     n = A % NumberOfRows
 
-    ! Global continuous numbering. Owner(i)==1 marks the rows this rank owns;
-    ! they get the contiguous global range [gStartLoc+1, gStartLoc+nOwnLoc].
-    ! Recomputed every call so the owned-row / solution mapping is available on
-    ! solve-only calls too; it is deterministic, so it stays consistent with the
-    ! numbering the factorization was built from.
-    IF ( ASSOCIATED(A % Gorder) ) DEALLOCATE(A % Gorder)
-    ALLOCATE( A % Gorder(n), Owner(n) )
-    CALL ContinuousNumbering( A % ParallelInfo, A % Perm, A % Gorder, Owner, &
-            nOwn=nOwnLoc, gStart=gStartLoc )
-    CALL MPI_ALLREDUCE( SUM(Owner), nGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
+    ! Global continuous numbering
+    CALL CUDSS_GRenumberAndCount( A, Owner, nOwnLoc, gStartLoc, nGlob )
 
     first_row = gStartLoc                 ! 0-based, inclusive
     last_row  = gStartLoc + nOwnLoc - 1   ! empty rank: last_row = first_row-1
@@ -992,10 +972,7 @@ CONTAINS
     IF ( .NOT. Found ) Factorize = .TRUE.
 
     IF ( Factorize .OR. A % Cudss==0 ) THEN
-      IF ( A % Cudss/=0 ) THEN
-        CALL cudss_ffree(A % Cudss)
-        A % Cudss = 0
-      END IF
+      CALL CUDSS_FreeHandle( A )
 
       ! Assemble the owned rows into one fully summed CSR with global column
       ! indices. This is where the shared interface rows are summed into their
@@ -1042,8 +1019,7 @@ CONTAINS
         'Linear System Free Factorization', Found )
     IF ( .NOT. Found ) FreeFactorize = .TRUE.
     IF ( Factorize .AND. FreeFactorize ) THEN
-      CALL cudss_ffree(A % Cudss)
-      A % Cudss = 0
+      CALL CUDSS_FreeHandle( A )
     END IF
 #else
     CALL Fatal( 'CUDSS_DistSolveReal', 'cuDSS Solver has not been installed.' )
@@ -1097,11 +1073,6 @@ CONTAINS
         INTEGER :: n, status
         INTEGER(KIND=AddrInt) :: cudss
       END SUBROUTINE cudss_zsolve
-
-      SUBROUTINE cudss_ffree(cudss) BIND(c,NAME="cudss_ffree")
-        USE Types
-        INTEGER(KIND=AddrInt) :: cudss
-      END SUBROUTINE cudss_ffree
     END INTERFACE
 
     LOGICAL :: Factorize, FreeFactorize, Found
@@ -1115,22 +1086,15 @@ CONTAINS
     ! Free-only entry.
     IF ( PRESENT(Free_Fact) ) THEN
       IF ( Free_Fact ) THEN
-        IF ( A % Cudss/=0 ) THEN
-          CALL cudss_ffree(A % Cudss)
-          A % Cudss = 0
-        END IF
+        CALL CUDSS_FreeHandle( A )
         RETURN
       END IF
     END IF
 
     n = A % NumberOfRows
 
-    ! Numbering runs in the 2n scalar-row space, just as for the real driver;
-    ! Owner(i)==1 marks the scalar rows this rank owns.
-    IF ( ASSOCIATED(A % Gorder) ) DEALLOCATE(A % Gorder)
-    ALLOCATE( A % Gorder(n), Owner(n) )
-    CALL ContinuousNumbering( A % ParallelInfo, A % Perm, A % Gorder, Owner, &
-            nOwn=nOwnLoc, gStart=gStartLoc )
+    ! Global continuous numbering
+    CALL CUDSS_GRenumberAndCount( A, Owner, nOwnLoc, gStartLoc, nGlob )
 
     ! Complex blocks need an even owned base and count on every rank; the choice
     ! must be unanimous or the collective factorize would diverge. If it does not
@@ -1147,7 +1111,6 @@ CONTAINS
       RETURN
     END IF
 
-    CALL MPI_ALLREDUCE( SUM(Owner), nGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
     nOwnC   = nOwnLoc / 2
     gStartC = gStartLoc / 2
     nGlobC  = nGlob / 2
@@ -1161,10 +1124,7 @@ CONTAINS
     IF ( .NOT. Found ) Factorize = .TRUE.
 
     IF ( Factorize .OR. A % Cudss==0 ) THEN
-      IF ( A % Cudss/=0 ) THEN
-        CALL cudss_ffree(A % Cudss)
-        A % Cudss = 0
-      END IF
+      CALL CUDSS_FreeHandle( A )
 
       ! Assemble the owned scalar rows (real, summed), then pack the 2x2 blocks
       ! into a complex CSR of order nOwnC.
@@ -1219,8 +1179,7 @@ CONTAINS
         'Linear System Free Factorization', Found )
     IF ( .NOT. Found ) FreeFactorize = .TRUE.
     IF ( Factorize .AND. FreeFactorize ) THEN
-      CALL cudss_ffree(A % Cudss)
-      A % Cudss = 0
+      CALL CUDSS_FreeHandle( A )
     END IF
 #else
     CALL Fatal( 'CUDSS_DistSolveComplex', 'cuDSS Solver has not been installed.' )
@@ -1228,6 +1187,60 @@ CONTAINS
 !------------------------------------------------------------------------------
   END SUBROUTINE CUDSS_DistSolveComplex
 !------------------------------------------------------------------------------
+
+
+#ifdef HAVE_CUDSS
+!------------------------------------------------------------------------------
+!> Global contiguous renumbering of dofs with ContinuousNumbering and counting global 
+!> dofs with MPI_ALLREDUCE for CUDSS MGMN. This rank is assigned to rows
+!> [gStartLoc+1, gStartLoc+nOwnLoc] in the global system.
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_GRenumberAndCount( A, Owner, nOwnLoc, gStartLoc, nGlob )
+!------------------------------------------------------------------------------
+#ifdef ELMER_HAVE_MPI_MODULE
+    USE mpi
+#endif
+    TYPE(Matrix_t) :: A
+    INTEGER, ALLOCATABLE :: Owner(:)
+    INTEGER :: nOwnLoc, gStartLoc, nGlob
+#ifdef ELMER_HAVE_MPIF_HEADER
+    INCLUDE 'mpif.h'
+#endif
+    INTEGER :: n, ierr
+!------------------------------------------------------------------------------
+    n = A % NumberOfRows
+    IF ( ASSOCIATED(A % Gorder) ) DEALLOCATE(A % Gorder)
+    ALLOCATE( A % Gorder(n), Owner(n) )
+    CALL ContinuousNumbering( A % ParallelInfo, A % Perm, A % Gorder, Owner, &
+            nOwn=nOwnLoc, gStart=gStartLoc )
+    CALL MPI_ALLREDUCE( SUM(Owner), nGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_GRenumberAndCount
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Free the stored cuDSS factorization handle if one is held, then clear it.
+!> Shared by the distributed drivers for the free-only entry, the refactor
+!> teardown, and the post-solve free.
+!------------------------------------------------------------------------------
+  SUBROUTINE CUDSS_FreeHandle( A )
+!------------------------------------------------------------------------------
+    TYPE(Matrix_t) :: A
+    INTERFACE
+      SUBROUTINE cudss_ffree(cudss) BIND(c,NAME="cudss_ffree")
+        USE Types
+        INTEGER(KIND=AddrInt) :: cudss
+      END SUBROUTINE cudss_ffree
+    END INTERFACE
+    IF ( A % Cudss /= 0 ) THEN
+      CALL cudss_ffree( A % Cudss )
+      A % Cudss = 0
+    END IF
+!------------------------------------------------------------------------------
+  END SUBROUTINE CUDSS_FreeHandle
+!------------------------------------------------------------------------------
+#endif
 
 
 !------------------------------------------------------------------------------
