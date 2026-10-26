@@ -899,16 +899,6 @@ CONTAINS
 !> Distributed (MGMN) cuDSS solve for a general real system
 !> Ranks are assigned contiguous range of global indices with ContinuousNumbering 
 !> for the rows they own. Then cuDSS receives non-overlapping block-row partition.
-  
-!> ContinuousNumbering gives each rank a contiguous range of global indices for
-!> the rows it owns; we assemble those owned rows fully (summing the shared
-!> interface rows into their owner), hand cuDSS a clean non-overlapping 1D
-!> block-row partition, and scatter the owned solution back with a parallel sum.
-!> Complex systems arrive here as their equivalent real 2x2-block form: Elmer's
-!> ParallelInfo numbers the 2n scalar rows, so nothing below needs to know the
-!> system is complex -- each scalar row is just a dof. This costs ~2x compared
-!> with factorizing the true complex system. SPD is not special-cased; the
-!> matrix type is always general (correct for the ERF, which is non-symmetric).
 !------------------------------------------------------------------------------
   SUBROUTINE CUDSS_DistSolveReal( Solver, A, x, b, Free_Fact )
 !------------------------------------------------------------------------------
