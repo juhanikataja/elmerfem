@@ -370,7 +370,7 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
    * ncclComm_t and only CUDSS_DATA_COMM_HOST would stay MPI. If you build
    * against an older cuDSS that still has the single CUDSS_DATA_COMM, replace
    * the two calls below with one on CUDSS_DATA_COMM. */
-  if (!cudss_ok(cudssSetCommLayer(ctx->handle, NULL), "cudssSetCommLayer") ||
+  if (!cudss_ok(cudssSetCommLayer(ctx->handle, ELMER_CUDSS_COMMLAYER_NAME), "cudssSetCommLayer") ||
       !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM_DEVICE,
                     &ctx->comm, sizeof(&ctx->comm)), "cudssDataSet(COMM_DEVICE)") ||
       !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM_HOST,

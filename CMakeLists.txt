@@ -319,6 +319,7 @@ IF(WITH_CUDSS)
   FIND_PACKAGE(CUDSS REQUIRED)
   SET(COMPILE_CUDSS_COMMLAYER TRUE CACHE BOOL "Compile CcuDSS communication layer. Not required if the cuDSS supplied library works.")
 
+
   IF(COMPILE_CUDSS_COMMLAYER)
     SET(CUDSS_COMMLAYER_SRC_MPI "${CUDSS_INCLUDE_DIR}/../src/cudss_commlayer_openmpi.cu" CACHE FILEPATH "Source file for the cuDSS MPI communication layer.")
     include(CheckLanguage)
@@ -333,7 +334,11 @@ IF(WITH_CUDSS)
     target_include_directories(elmer_cudss_commlayer PRIVATE ${CUDA_INCLUDE_DIR} ${CUDSS_INCLUDE_DIR})
     target_link_libraries(elmer_cudss_commlayer PRIVATE MPI::MPI_C CUDA::cudart)
     install(TARGETS elmer_cudss_commlayer LIBRARY DESTINATION ${ELMER_INSTALL_LIB_DIR})
+    SET(ELMER_CUDSS_COMMLAYER_NAME "\"elmer_cudss_commlayer.${CMAKE_SHARED_LIBRARY_SUFFIX}\"" INTERNAL)
+  ELSE()
+    SET(ELMER_CUDSS_COMMLAYER_NAME NULL INTERNAL)
   ENDIF(COMPILE_CUDSS_COMMLAYER)
+
 ENDIF()
 
 # if(APPLE)
