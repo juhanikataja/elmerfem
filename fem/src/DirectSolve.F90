@@ -917,14 +917,14 @@ CONTAINS
     INCLUDE 'mpif.h'
 #  endif
     INTERFACE
-      FUNCTION cudss_dfactorize(nglob,nnz_glob,nloc,nnzloc,first_row,last_row, &
-          rows,cols,vals,mtype,fcomm) RESULT(cudss) BIND(c,NAME="cudss_dfactorize")
+      FUNCTION cudss_dfactorize_par(nglob,nnz_glob,nloc,nnzloc,first_row,last_row, &
+          rows,cols,vals,mtype,fcomm) RESULT(cudss) BIND(c,NAME="cudss_dfactorize_par")
         USE Types
         INTEGER :: nglob,nnz_glob,nloc,nnzloc,first_row,last_row,mtype,fcomm
         INTEGER :: rows(*), cols(*)
         REAL(KIND=dp) :: vals(*)
         INTEGER(KIND=AddrInt) :: cudss
-      END FUNCTION cudss_dfactorize
+      END FUNCTION cudss_dfactorize_par
 
       SUBROUTINE cudss_fsolve(cudss, n, x, b, status) BIND(c,NAME="cudss_fsolve")
         USE Types
@@ -971,7 +971,7 @@ CONTAINS
               Rloc, Cloc, Vloc, nnzLoc )
       CALL MPI_ALLREDUCE( nnzLoc, nnzGlob, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
 
-      A % Cudss = cudss_dfactorize( nGlob, nnzGlob, nOwnLoc, nnzLoc, &
+      A % Cudss = cudss_dfactorize_par( nGlob, nnzGlob, nOwnLoc, nnzLoc, &
               first_row, last_row, Rloc, Cloc, Vloc, mtype, A % Comm )
       DEALLOCATE( Rloc, Cloc, Vloc )
 
@@ -1043,14 +1043,14 @@ CONTAINS
     INCLUDE 'mpif.h'
 #  endif
     INTERFACE
-      FUNCTION cudss_zdfactorize(nglob,nnz_glob,nloc,nnzloc,first_row,last_row, &
-          rows,cols,vals,mtype,fcomm) RESULT(cudss) BIND(c,NAME="cudss_zdfactorize")
+      FUNCTION cudss_zdfactorize_par(nglob,nnz_glob,nloc,nnzloc,first_row,last_row, &
+          rows,cols,vals,mtype,fcomm) RESULT(cudss) BIND(c,NAME="cudss_zdfactorize_par")
         USE Types
         INTEGER :: nglob,nnz_glob,nloc,nnzloc,first_row,last_row,mtype,fcomm
         INTEGER :: rows(*), cols(*)
         COMPLEX(KIND=dp) :: vals(*)
         INTEGER(KIND=AddrInt) :: cudss
-      END FUNCTION cudss_zdfactorize
+      END FUNCTION cudss_zdfactorize_par
 
       SUBROUTINE cudss_zsolve(cudss, n, x, b, status) BIND(c,NAME="cudss_zsolve")
         USE Types
@@ -1121,7 +1121,7 @@ CONTAINS
 
       CALL MPI_ALLREDUCE( nnzLocC, nnzGlobC, 1, MPI_INTEGER, MPI_SUM, A % Comm, ierr )
 
-      A % Cudss = cudss_zdfactorize( nGlobC, nnzGlobC, nOwnC, nnzLocC, &
+      A % Cudss = cudss_zdfactorize_par( nGlobC, nnzGlobC, nOwnC, nnzLocC, &
               first_row, last_row, ZRloc, ZCloc, ZVloc, mtype, A % Comm )
       DEALLOCATE( ZRloc, ZCloc, ZVloc )
 

@@ -1,4 +1,3 @@
-/*
  * C wrapper around NVIDIA's cuDSS GPU sparse direct solver, callable
  * from Fortran (see CUDSS_SolveSystem in DirectSolve.F90). 
  * Three entry points (factorize, solve, free).
@@ -10,9 +9,13 @@
  * passes a matrix in *complex* CSR for the z entries (n complex rows, not the
  * 2n real rows Elmer stores internally).
  *
- * Single-GPU only, 1 MPI task. The CSR matrix is copied to device memory once, at
+ * For Single-GPU and 1 MPI task. The CSR matrix is copied to device memory once, at
  * factorize time; only the right-hand side and solution are transferred on
  * every solve.
+ *
+ * For Multi-GPU Multi-node setup the additional entry points are 
+ * cudss_dfactorize_par (double precision real), cudss_zdfactorize_par (double
+ * precision complex).
  */
 
 #include "../config.h"
@@ -288,7 +291,7 @@ static void cudss_bind_device(MPI_Comm comm)
  * 1-based from Fortran). cols: GLOBAL column indices (1-based). first_row/
  * last_row: 0-based inclusive global range of the owned block (empty rank:
  * first_row > last_row). */
-static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
+static ElmerCUDSS *cudss_dfactorize_par_impl(int nglob, int nnz_glob, int nloc,
     int nnzloc, int first_row, int last_row, const int *rows, const int *cols,
     const void *vals, int mtype, int is_complex, MPI_Comm comm)
 {
@@ -357,19 +360,19 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
     return NULL;
   }
 
-  /* Communication layer: the library name comes from the CUDSS_COMM_LIB
-   * environment variable (NULL here), and the communicator is handed to the
-   * data object. cuDSS stores the POINTER we pass and dereferences it later, so
-   * the value is &ctx->comm (a live MPI_Comm that outlives the solves) and the
-   * size is that of the pointer, sizeof(MPI_Comm*), not of the MPI_Comm.
+  /* The communication layer library name is determined compile time as macro
+   * definition ELMER_CUDSS_COMMLAYER_NAME. If that is NULL, then fall back to
+   * cuDSS default behavior: read the communication layer library name from
+   * CUDSS_COMM_LIB environment variable.
    *
-   * Recent cuDSS (which is what rejects the old single CUDSS_DATA_COMM) splits
-   * the communicator into a device and a host one. With the MPI (openmpi) comm
-   * layer both backends are MPI, so both get the same MPI communicator. For an
-   * NCCL device backend, CUDSS_DATA_COMM_DEVICE would instead take an
-   * ncclComm_t and only CUDSS_DATA_COMM_HOST would stay MPI. If you build
-   * against an older cuDSS that still has the single CUDSS_DATA_COMM, replace
-   * the two calls below with one on CUDSS_DATA_COMM. */
+   * cuDSS splits the communicator into a device and a host one. With the MPI
+   * (openmpi) comm layer both backends are MPI, so both get the same MPI
+   * communicator.  For an NCCL device backend, CUDSS_DATA_COMM_DEVICE would
+   * instead take an ncclComm_t and only CUDSS_DATA_COMM_HOST would stay MPI.
+   *
+   * If you build against an older cuDSS that still has the single
+   * CUDSS_DATA_COMM, replace the two calls below with one on CUDSS_DATA_COMM.
+   * */
   if (!cudss_ok(cudssSetCommLayer(ctx->handle, ELMER_CUDSS_COMMLAYER_NAME), "cudssSetCommLayer") ||
       !cudss_ok(cudssDataSet(ctx->handle, ctx->data, CUDSS_DATA_COMM_DEVICE,
                     &ctx->comm, sizeof(&ctx->comm)), "cudssDataSet(COMM_DEVICE)") ||
@@ -419,13 +422,13 @@ static ElmerCUDSS *cudss_dfactorize_impl(int nglob, int nnz_glob, int nloc,
 }
 #endif /* HAVE_MPI */
 
-ElmerCUDSS *FC_FUNC_(cudss_dfactorize,CUDSS_DFACTORIZE)
+ElmerCUDSS *FC_FUNC_(cudss_dfactorize_par,CUDSS_DFACTORIZE_PAR)
     (int *nglob, int *nnz_glob, int *nloc, int *nnzloc, int *first_row,
      int *last_row, int *rows, int *cols, double *vals, int *mtype, int *fcomm)
 {
 #ifdef HAVE_MPI
   MPI_Comm comm = MPI_Comm_f2c(*fcomm);
-  return cudss_dfactorize_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
+  return cudss_dfactorize_par_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
       *last_row, rows, cols, vals, *mtype, 0, comm);
 #else
   (void)nglob; (void)nnz_glob; (void)nloc; (void)nnzloc; (void)first_row;
@@ -438,13 +441,13 @@ ElmerCUDSS *FC_FUNC_(cudss_dfactorize,CUDSS_DFACTORIZE)
 /* Complex counterpart: the matrix is a complex CSR of order n (not Elmer's
  * real 2n), vals holds 2*nnzloc interleaved (re,im) doubles -- i.e. Fortran
  * COMPLEX(KIND=dp), layout-compatible with cuDoubleComplex. */
-ElmerCUDSS *FC_FUNC_(cudss_zdfactorize,CUDSS_ZDFACTORIZE)
+ElmerCUDSS *FC_FUNC_(cudss_zdfactorize_par,CUDSS_ZDFACTORIZE_PAR)
     (int *nglob, int *nnz_glob, int *nloc, int *nnzloc, int *first_row,
      int *last_row, int *rows, int *cols, double *vals, int *mtype, int *fcomm)
 {
 #ifdef HAVE_MPI
   MPI_Comm comm = MPI_Comm_f2c(*fcomm);
-  return cudss_dfactorize_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
+  return cudss_dfactorize_par_impl(*nglob, *nnz_glob, *nloc, *nnzloc, *first_row,
       *last_row, rows, cols, vals, *mtype, 1, comm);
 #else
   (void)nglob; (void)nnz_glob; (void)nloc; (void)nnzloc; (void)first_row;
