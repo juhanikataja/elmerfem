@@ -1,4 +1,4 @@
- * C wrapper around NVIDIA's cuDSS GPU sparse direct solver, callable
+ /* C wrapper around NVIDIA's cuDSS GPU sparse direct solver, callable
  * from Fortran (see CUDSS_SolveSystem in DirectSolve.F90). 
  * Three entry points (factorize, solve, free).
  *
