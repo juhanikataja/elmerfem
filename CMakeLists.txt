@@ -317,7 +317,7 @@ ENDIF()
 IF(WITH_CUDSS)
   FIND_PACKAGE(CUDAToolkit REQUIRED)
   FIND_PACKAGE(CUDSS REQUIRED)
-  SET(COMPILE_CUDSS_COMMLAYER TRUE CACHE BOOL "Compile CcuDSS communication layer. Not required if the cuDSS supplied library works.")
+  SET(COMPILE_CUDSS_COMMLAYER TRUE CACHE BOOL "Compile cuDSS communication layer library. Not required if the cuDSS supplied one works.")
 
 
   IF(COMPILE_CUDSS_COMMLAYER)

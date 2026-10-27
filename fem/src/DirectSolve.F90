@@ -1020,16 +1020,11 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
-!> Distributed (MGMN) cuDSS solve for a complex system, factorizing the true
-!> order-n complex system rather than its real 2x2-block form. The owned rows
-!> are assembled in the 2n scalar-row space exactly as the real driver does
-!> (reusing CUDSS_AssembleOwnedRowsR), then the owned block is packed into a
-!> complex CSR of half the order (CUDSS_PackOwnedComplex) and handed to cuDSS as
-!> CUDSS_C_64F. This needs each complex dof's two scalar rows to be owned
-!> together and numbered consecutively, so that a rank's owned scalar-row base
-!> and count are both even -- the same condition ZMumps checks. When that does
-!> not hold (reduced across all ranks, since the choice must be unanimous), it
-!> falls back to the real-ERF driver.
+!> Distributed (MGMN) cuDSS solve for a complex system.
+!> Renumbers/reassembles in real 2x2-block representation of complex system and then
+!> uses that to factorize in complex arithmetic (CUDSS_C_64F) in cuDSS. 
+!> If the renumbering/reassembling of consecutive rows is not unanimous across ranks,
+!> then falls back to real factorization of the original 2x2-block matrix.
 !------------------------------------------------------------------------------
   SUBROUTINE CUDSS_DistSolveComplex( Solver, A, x, b, Free_Fact )
 !------------------------------------------------------------------------------
@@ -1235,12 +1230,9 @@ CONTAINS
 
 !------------------------------------------------------------------------------
 !> Pack an owned-block real 2x2 CSR (scalar-row space, as produced by
-!> CUDSS_AssembleOwnedRowsR) into a complex CSR of order nOwnC. Only the odd
-!> (first) scalar row of each block is read: Elmer stores each complex entry
-!> a+bi as the real block [[a,-b],[b,a]], so the odd row holds, for each complex
-!> column m, the pair (col 2m-1 = a, col 2m = -b) in adjacent, column-sorted
-!> positions. The complex value is CMPLX(a,-(-b)) = a+bi and the complex column
-!> is (2m-1+1)/2 = m, exactly as ZMumps_SolveSystem / the serial cuDSS path do.
+!> CUDSS_AssembleOwnedRowsR) into a complex CSR of order nOwnC. 
+!> The complex CSR values are collected from the odd rows of the real 
+!> 2x2-block matrix.
 !------------------------------------------------------------------------------
   SUBROUTINE CUDSS_PackOwnedComplex( Rloc, Cloc, Vloc, nOwnC, &
              ZRloc, ZCloc, ZVloc, nnzLocC )
