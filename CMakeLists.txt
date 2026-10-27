@@ -313,9 +313,11 @@ IF(WITH_CHOLMOD)
   FIND_PACKAGE(SPQR)
 ENDIF()
 
-# cuDSS: NVIDIA's GPU sparse direct solver. Single-GPU only for now.
+# cuDSS: NVIDIA's GPU sparse direct solver. 
 IF(WITH_CUDSS)
   FIND_PACKAGE(CUDAToolkit REQUIRED)
+
+  # Find cuDSS from CUDSS_ROOT.
   FIND_PACKAGE(CUDSS REQUIRED)
   SET(COMPILE_CUDSS_COMMLAYER TRUE CACHE BOOL "Compile cuDSS communication layer library. Not required if the cuDSS supplied one works.")
 
